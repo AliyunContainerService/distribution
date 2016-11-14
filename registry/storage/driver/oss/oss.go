@@ -26,6 +26,7 @@ import (
 
 	"github.com/Sirupsen/logrus"
 	"github.com/denverdino/aliyungo/oss"
+	"github.com/docker/distribution/registry/storage/cdn"
 	storagedriver "github.com/docker/distribution/registry/storage/driver"
 	"github.com/docker/distribution/registry/storage/driver/base"
 	"github.com/docker/distribution/registry/storage/driver/factory"
@@ -48,6 +49,7 @@ type DriverParameters struct {
 	AccessKeyID     string
 	AccessKeySecret string
 	Bucket          string
+	CDNBucket       string
 	Region          oss.Region
 	Internal        bool
 	Encrypt         bool
@@ -71,6 +73,7 @@ func (factory *ossDriverFactory) Create(parameters map[string]interface{}) (stor
 type driver struct {
 	Client        *oss.Client
 	Bucket        *oss.Bucket
+	CDNBucket     *oss.Bucket
 	ChunkSize     int64
 	Encrypt       bool
 	RootDirectory string
@@ -113,6 +116,11 @@ func FromParameters(parameters map[string]interface{}) (*Driver, error) {
 	bucket, ok := parameters["bucket"]
 	if !ok || fmt.Sprint(bucket) == "" {
 		return nil, fmt.Errorf("No bucket parameter provided")
+	}
+
+	cdnBucket, ok := parameters["cdnbucket"]
+	if ok {
+		fmt.Printf("Use cdn bucket: %v\n", cdnBucket)
 	}
 
 	internalBool := false
@@ -179,6 +187,7 @@ func FromParameters(parameters map[string]interface{}) (*Driver, error) {
 		AccessKeyID:     fmt.Sprint(accessKey),
 		AccessKeySecret: fmt.Sprint(secretKey),
 		Bucket:          fmt.Sprint(bucket),
+		CDNBucket:       fmt.Sprint(cdnBucket),
 		Region:          oss.Region(fmt.Sprint(regionName)),
 		ChunkSize:       chunkSize,
 		RootDirectory:   fmt.Sprint(rootDirectory),
@@ -206,12 +215,21 @@ func New(params DriverParameters) (*Driver, error) {
 		return nil, err
 	}
 
+	var cdnBucket *oss.Bucket
+	if params.CDNBucket != "" {
+		cdnBucket = client.Bucket(params.CDNBucket)
+		if _, err := cdnBucket.List(strings.TrimRight(params.RootDirectory, "/"), "", "", 1); err != nil {
+			return nil, err
+		}
+	}
+
 	// TODO(tg123): Currently multipart uploads have no timestamps, so this would be unwise
 	// if you initiated a new OSS client while another one is running on the same bucket.
 
 	d := &driver{
 		Client:        client,
 		Bucket:        bucket,
+		CDNBucket:     cdnBucket,
 		ChunkSize:     params.ChunkSize,
 		Encrypt:       params.Encrypt,
 		RootDirectory: params.RootDirectory,
@@ -232,9 +250,17 @@ func (d *driver) Name() string {
 	return driverName
 }
 
+func (d *driver) getBucket(ctx context.Context) *oss.Bucket {
+	repo := ctx.Value("vars.name")
+	if d.CDNBucket != nil && repo != nil && cdn.UseCDN(repo.(string)) {
+		return d.CDNBucket
+	}
+	return d.Bucket
+}
+
 // GetContent retrieves the content stored at "path" as a []byte.
 func (d *driver) GetContent(ctx context.Context, path string) ([]byte, error) {
-	content, err := d.Bucket.Get(d.ossPath(path))
+	content, err := d.getBucket(ctx).Get(d.ossPath(path))
 	if err != nil {
 		return nil, parseError(path, err)
 	}
@@ -243,7 +269,7 @@ func (d *driver) GetContent(ctx context.Context, path string) ([]byte, error) {
 
 // PutContent stores the []byte content at a location designated by "path".
 func (d *driver) PutContent(ctx context.Context, path string, contents []byte) error {
-	return parseError(path, d.Bucket.Put(d.ossPath(path), contents, d.getContentType(), getPermissions(), d.getOptions()))
+	return parseError(path, d.getBucket(ctx).Put(d.ossPath(path), contents, d.getContentType(), getPermissions(), d.getOptions()))
 }
 
 // Reader retrieves an io.ReadCloser for the content stored at "path" with a
@@ -252,7 +278,7 @@ func (d *driver) Reader(ctx context.Context, path string, offset int64) (io.Read
 	headers := make(http.Header)
 	headers.Add("Range", "bytes="+strconv.FormatInt(offset, 10)+"-")
 
-	resp, err := d.Bucket.GetResponseWithHeaders(d.ossPath(path), headers)
+	resp, err := d.getBucket(ctx).GetResponseWithHeaders(d.ossPath(path), headers)
 	if err != nil {
 		return nil, parseError(path, err)
 	}
@@ -275,13 +301,13 @@ func (d *driver) Writer(ctx context.Context, path string, append bool) (storaged
 	key := d.ossPath(path)
 	if !append {
 		// TODO (brianbland): cancel other uploads at this path
-		multi, err := d.Bucket.InitMulti(key, d.getContentType(), getPermissions(), d.getOptions())
+		multi, err := d.getBucket(ctx).InitMulti(key, d.getContentType(), getPermissions(), d.getOptions())
 		if err != nil {
 			return nil, err
 		}
 		return d.newWriter(key, multi, nil), nil
 	}
-	multis, _, err := d.Bucket.ListMulti(key, "")
+	multis, _, err := d.getBucket(ctx).ListMulti(key, "")
 	if err != nil {
 		return nil, parseError(path, err)
 	}
@@ -305,7 +331,7 @@ func (d *driver) Writer(ctx context.Context, path string, append bool) (storaged
 // Stat retrieves the FileInfo for the given path, including the current size
 // in bytes and the creation time.
 func (d *driver) Stat(ctx context.Context, path string) (storagedriver.FileInfo, error) {
-	listResponse, err := d.Bucket.List(d.ossPath(path), "", "", 1)
+	listResponse, err := d.getBucket(ctx).List(d.ossPath(path), "", "", 1)
 	if err != nil {
 		return nil, err
 	}
@@ -351,7 +377,7 @@ func (d *driver) List(ctx context.Context, opath string) ([]string, error) {
 		prefix = "/"
 	}
 
-	listResponse, err := d.Bucket.List(d.ossPath(path), "/", "", listMax)
+	listResponse, err := d.getBucket(ctx).List(d.ossPath(path), "/", "", listMax)
 	if err != nil {
 		return nil, parseError(opath, err)
 	}
@@ -369,7 +395,7 @@ func (d *driver) List(ctx context.Context, opath string) ([]string, error) {
 		}
 
 		if listResponse.IsTruncated {
-			listResponse, err = d.Bucket.List(d.ossPath(path), "/", listResponse.NextMarker, listMax)
+			listResponse, err = d.getBucket(ctx).List(d.ossPath(path), "/", listResponse.NextMarker, listMax)
 			if err != nil {
 				return nil, err
 			}
@@ -395,7 +421,7 @@ const maxConcurrency = 10
 // object.
 func (d *driver) Move(ctx context.Context, sourcePath string, destPath string) error {
 	logrus.Infof("Move from %s to %s", d.ossPath(sourcePath), d.ossPath(destPath))
-	err := d.Bucket.CopyLargeFileInParallel(d.ossPath(sourcePath), d.ossPath(destPath),
+	err := d.getBucket(ctx).CopyLargeFileInParallel(d.ossPath(sourcePath), d.ossPath(destPath),
 		d.getContentType(),
 		getPermissions(),
 		oss.Options{},
@@ -411,7 +437,7 @@ func (d *driver) Move(ctx context.Context, sourcePath string, destPath string) e
 // Delete recursively deletes all objects stored at "path" and its subpaths.
 func (d *driver) Delete(ctx context.Context, path string) error {
 	ossPath := d.ossPath(path)
-	listResponse, err := d.Bucket.List(ossPath, "", "", listMax)
+	listResponse, err := d.getBucket(ctx).List(ossPath, "", "", listMax)
 	if err != nil || len(listResponse.Contents) == 0 {
 		return storagedriver.PathNotFoundError{Path: path}
 	}
@@ -429,7 +455,7 @@ func (d *driver) Delete(ctx context.Context, path string) error {
 			ossObjects[index].Key = key.Key
 		}
 
-		err := d.Bucket.DelMulti(oss.Delete{Quiet: false, Objects: ossObjects[0:numOssObjects]})
+		err := d.getBucket(ctx).DelMulti(oss.Delete{Quiet: false, Objects: ossObjects[0:numOssObjects]})
 		if err != nil {
 			return nil
 		}
@@ -438,7 +464,7 @@ func (d *driver) Delete(ctx context.Context, path string) error {
 			return nil
 		}
 
-		listResponse, err = d.Bucket.List(d.ossPath(path), "", "", listMax)
+		listResponse, err = d.getBucket(ctx).List(d.ossPath(path), "", "", listMax)
 		if err != nil {
 			return err
 		}
@@ -469,7 +495,7 @@ func (d *driver) URLFor(ctx context.Context, path string, options map[string]int
 		}
 	}
 	logrus.Infof("methodString: %s, expiresTime: %v", methodString, expiresTime)
-	signedURL := d.Bucket.SignedURLWithMethod(methodString, d.ossPath(path), expiresTime, nil, nil)
+	signedURL := d.getBucket(ctx).SignedURLWithMethod(methodString, d.ossPath(path), expiresTime, nil, nil)
 	logrus.Infof("signed URL: %s", signedURL)
 	return signedURL, nil
 }
